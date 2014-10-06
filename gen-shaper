@@ -1,0 +1,202 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+# ./gen-shaper > shaper && chmod a+x shaper && scp shaper er:/config/scripts/post-config.d
+
+# Configure the root shapes, up and down the WAN interface
+my $LINE_UP = '20mbit';
+my $LINE_DN = '20mbit';
+
+# This is the ethernet interface that the upstream is connected to:
+my $WANIF = 'eth4';
+
+# This is the default shape that's used for all traffic that doesn't get matched
+# by the rules
+my $DEFAULT_UP = '2mbit';
+my $DEFAULT_DN = '2mbit';
+
+# These are the internal network interfaces that get all their in-coming traffic
+# smushed together in the ifb0 interface to allow fair sharing of bandwidth:
+my @INTERNAL = qw(eth1 eth2 eth3);
+
+
+# These are the subnets that each get a fair (round-robin assigned) chunks of traffic
+# at this point we don't really care where these subnets live, but on my router
+# I keep each subnet on the eth1, eth2 and eth3 respectively.
+#
+# You could choose each of these shares to sit on many more networks of any size you want
+# The up and dn fields are used to set the maximum bandwidth usages allowed for each share
+# The id is simply a 4 hex digit id assigned to each share.
+my %NET = (
+   '10.1.0.0/24' => {
+       id=>'1001',
+       up=>'20mbit',
+       dn=>'20mbit',
+   },
+
+   '10.2.0.0/24' => {
+       id=>'1002',
+       up=>'15mbit',
+       dn=>'15mbit',
+   },
+
+   '10.3.0.0/24' => {
+       id=>'1003',
+       up=>'15mbit',
+       dn=>'15mbit',
+   },
+);
+
+
+my $wanMangling = '';
+for my $eth (@INTERNAL) {
+    $wanMangling .= "
+#----------------------------------------------------------------------------
+# Traffic shaping: Set up for inbound traffic destined for $eth
+#----------------------------------------------------------------------------
+iptables -t mangle -A PREROUTING -i $eth -j to-wan
+
+tc qdisc del dev $eth root
+tc qdisc add dev $eth root handle 1: htb
+tc filter add dev $eth parent 1: protocol ip prio 10 u32 match u32 0 0 action mirred egress redirect dev ifb0
+
+";
+}
+
+
+my $subnetShapes = '';
+my $perturb = 20;
+for my $subnet (sort keys %NET) {
+    my %sn = %{$NET{$subnet}};
+    my $perturb1 = $perturb +1;
+    $subnetShapes .= "
+#Adding outbound shaping for subnet: $subnet
+iptables -t mangle -A to-wan -s $subnet -j MARK --set-mark 0x1$sn{id}
+iptables -t mangle -A to-wan -s $subnet -j RETURN
+tc class add dev $WANIF parent 1:1 classid 1:$sn{id} htb rate 20kbit ceil $sn{up} prio 10 cburst 15000 burst 30000 quantum 5000
+tc qdisc add dev $WANIF parent 1:$sn{id} sfq perturb $perturb
+    
+#Adding inbound shaping for subnet: $subnet
+tc filter add dev ifb0 parent 1: protocol ip prio 1 u32 match ip dst $subnet flowid 1:$sn{id}
+tc class  add dev ifb0 parent 1:1 classid 1:$sn{id} htb rate 20kbit ceil $sn{dn} prio 10 cburst 15000 burst 30000 quantum 5000
+tc qdisc  add dev ifb0 parent 1:$sn{id} sfq perturb $perturb1
+
+";
+    $perturb += 2;
+}
+
+print << "__EOS__";
+#!/bin/sh 
+
+export PATH=/usr/local/sbin:/sbin:/usr/sbin:\${PATH}
+
+
+
+# Load NAT modules
+modprobe iptable_nat
+modprobe ip_nat_ftp
+modprobe ip_nat_irc
+
+modprobe ipt_REDIRECT
+modprobe ipt_MARK
+
+# Load connection-tracking modules
+modprobe ip_conntrack
+modprobe ip_conntrack_ftp
+modprobe ip_conntrack_irc
+modprobe act_mirred
+modprobe ipt_REDIRECT
+modprobe ipt_MARK
+modprobe ifb
+
+ifconfig ifb0 up
+
+
+# Disable response to broadcasts.
+echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts
+
+# Don't accept source routed packets.
+echo 0 > /proc/sys/net/ipv4/conf/all/accept_source_route
+
+# Disable ICMP redirect acceptance.
+echo 0 > /proc/sys/net/ipv4/conf/all/accept_redirects
+
+# Enable bad error message protection
+echo 1 > /proc/sys/net/ipv4/icmp_ignore_bogus_error_responses
+
+# Log spoofed packets, source routed packets, redirect packets
+echo 1 > /proc/sys/net/ipv4/conf/all/log_martians
+
+# Turn on IP forwarding
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# Clean old iptables 
+iptables -F 
+iptables -X 
+iptables -Z
+iptables -t nat -F 
+iptables -t nat -X 
+iptables -t nat -Z
+iptables -t mangle -F 
+iptables -t mangle -X 
+iptables -t mangle -Z
+
+
+/sbin/iptables -t nat -A POSTROUTING -o $WANIF -j MASQUERADE
+/sbin/iptables -A FORWARD -i $WANIF -m state --state RELATED,ESTABLISHED -j ACCEPT
+/sbin/iptables -A FORWARD -i eth1 -o $WANIF -j ACCEPT
+/sbin/iptables -A FORWARD -i eth2 -o $WANIF -j ACCEPT
+/sbin/iptables -A FORWARD -i eth3 -o $WANIF -j ACCEPT
+/sbin/iptables -A FORWARD -i eth1 -j DROP
+/sbin/iptables -A FORWARD -i eth2 -j DROP
+/sbin/iptables -A FORWARD -i eth3 -j DROP
+
+
+iptables -t mangle -N to-wan
+iptables -t mangle -F to-wan
+iptables -t mangle -F PREROUTING
+
+
+#----------------------------------------------------------------------------
+# Traffic shaping: set up the shared shaper on ifb0
+#----------------------------------------------------------------------------
+
+#Root htb and the semi-root htb that all the traffic is going to go through:
+tc qdisc del dev ifb0 root
+tc qdisc add dev ifb0 root handle 1: htb default 0x42
+
+#----------------------------------------------------------------------------
+# Traffic shaping: Set up for outbound traffic
+#----------------------------------------------------------------------------
+
+#Root htb and the semi-root htb that all the traffic is going to go through:
+tc qdisc del dev $WANIF root
+tc qdisc add dev $WANIF root handle 1: htb default 0x42
+
+
+#Have the bucket that traffic gets dropped into be determined by the firewall mark
+#btw: --set-mark 0xbabeface maps to class id babe:face
+tc filter add dev $WANIF parent 1: protocol ip prio 2 fw
+
+# Set up limits for the root of the traffic shapers
+tc class add dev $WANIF parent 1: classid 1:1 htb rate $LINE_UP cburst 15000 burst 30000 quantum 5000
+tc class add dev ifb0 parent 1: classid 1:1 htb rate $LINE_DN cburst 15000 burst 30000 quantum 5000
+
+
+$wanMangling
+
+
+#Default class for everything not matched by the firewall rules:
+tc class add dev $WANIF parent 1:1 classid 1:42 htb rate 20kbit ceil $DEFAULT_UP prio 0 cburst 15000 burst 30000 quantum 5000
+tc qdisc add dev $WANIF parent 1:42 handle 42: sfq perturb 20 
+
+#Default class for everything not matched by the firewall rules:
+tc class add dev ifb0 parent 1:1 classid 1:42 htb rate 20kbit ceil $DEFAULT_DN prio 0 cburst 15000 burst 30000 quantum 5000
+tc qdisc add dev ifb0 parent 1:42 handle 42: sfq perturb 21 
+
+$subnetShapes
+
+
+__EOS__
+
